@@ -297,12 +297,23 @@ def _write_mentions(db, rx, term_map, cat, pid, channel, kind, ts, url, text, vi
 
 def ingest(db, rx, term_map, cat, channel, kind, url, ts, text, views):
     pid = hashlib.md5(f"{channel}|{url}|{text[:80]}".encode()).hexdigest()
-    if db.execute("SELECT 1 FROM posts WHERE id=?", (pid,)).fetchone():
+    old = db.execute("SELECT length(text), views FROM posts WHERE id=?", (pid,)).fetchone()
+    if old:
+        # پست تکراری است، ولی بازدید و متنِ کامل‌تر را به‌روز کن
+        if views > (old[1] or 0):
+            db.execute("UPDATE posts SET views=? WHERE id=?", (views, pid))
+            for t in ("mentions", "pairs"):
+                db.execute(f"UPDATE {t} SET views=? WHERE post_id=?", (views, pid))
+        if len(text) > old[0]:
+            db.execute("UPDATE posts SET text=? WHERE id=?", (text[:20000], pid))
+            for t in ("mentions", "brand_mentions", "pairs"):
+                db.execute(f"DELETE FROM {t} WHERE post_id=?", (pid,))
+            _write_mentions(db, rx, term_map, cat, pid, channel, kind, ts, url, text, views)
         return False
     if not _write_mentions(db, rx, term_map, cat, pid, channel, kind, ts, url, text, views):
         return False
     db.execute("INSERT OR IGNORE INTO posts VALUES(?,?,?,?,?,?,?)",
-               (pid, channel, ts, url, text[:2000], views, kind))
+               (pid, channel, ts, url, text[:20000], views, kind))
     return True
 
 
