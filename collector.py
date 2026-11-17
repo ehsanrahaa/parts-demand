@@ -13,14 +13,18 @@
 import argparse
 import calendar
 import hashlib
+import html
 import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote
 
 import requests
 from bs4 import BeautifulSoup
@@ -404,6 +408,26 @@ def build_report(db, top=500):
     brands_by_part = {}
     for p, b, c in brand_rows:
         brands_by_part.setdefault(p, []).append(f"{b} ({c})")
+    combo_brand_rows = db.execute("""
+        SELECT p.part, p.vehicle, b.brand, COUNT(DISTINCT b.post_id) c
+        FROM brand_mentions b JOIN pairs p ON p.post_id=b.post_id AND p.part=b.part
+        WHERE p.kind='seller' AND p.ts>=?
+        GROUP BY p.part, p.vehicle, b.brand ORDER BY c DESC""", (yr,)).fetchall()
+    combo_brands = {}
+    for p, v, b, c in combo_brand_rows:
+        combo_brands.setdefault((p, v), []).append(f"{b} ({c})")
+    brand_totals = db.execute("""
+        SELECT b.brand, COUNT(DISTINCT b.post_id), COUNT(DISTINCT b.part),
+               GROUP_CONCAT(DISTINCT b.part)
+        FROM brand_mentions b JOIN posts p ON p.id=b.post_id
+        WHERE p.kind='seller' AND p.ts>=?
+        GROUP BY b.brand""", (yr,)).fetchall()
+    brand_views = dict(db.execute("""
+        SELECT brand, SUM(views) FROM (
+          SELECT DISTINCT b.brand brand, p.id, p.views
+          FROM brand_mentions b JOIN posts p ON p.id=b.post_id
+          WHERE p.kind='seller' AND p.ts>=?
+        ) GROUP BY brand""", (yr,)).fetchall())
     sample = dict(db.execute("""
         SELECT part, url FROM mentions WHERE url!='' AND kind='seller'
         GROUP BY part ORDER BY MAX(views) DESC""").fetchall())
@@ -413,6 +437,7 @@ def build_report(db, top=500):
                SUM(CASE WHEN kind='news' THEN 1 ELSE 0 END),
                (SELECT SUM(posts_scanned) FROM runs) FROM posts""").fetchone()
     return {"parts": part_stats, "combos": combo_stats, "brands": brands_by_part,
+            "combo_brands": combo_brands, "brand_totals": brand_totals, "brand_views": brand_views,
             "sample": sample, "coverage": coverage, "yr": yr, "d90": d90, "top": top}
 
 
@@ -422,6 +447,152 @@ def write_csv(path, header, rows):
         w = csv.writer(f)
         w.writerow(header)
         w.writerows(rows)
+
+
+def find_chrome():
+    import shutil as _sh
+    for c in (os.environ.get("CHROME_BIN"),
+              "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+              _sh.which("google-chrome"), _sh.which("google-chrome-stable"),
+              _sh.which("chromium"), _sh.which("chromium-browser"),
+              "/usr/bin/google-chrome", "/usr/bin/chromium"):
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def make_pdf(html_path, pdf_path):
+    """HTML را با Chrome بی‌سر به PDF تبدیل می‌کند؛ بدون وابستگی پایتونی و با فونت‌های سیستم."""
+    chrome = find_chrome()
+    if not chrome:
+        log.warning("Chrome/Chromium پیدا نشد؛ PDF ساخته نشد (HTML موجود است)")
+        return False
+    if os.path.exists(pdf_path):
+        os.remove(pdf_path)
+    url = "file://" + quote(os.path.abspath(html_path))
+    for mode in ("--headless=new", "--headless"):
+        cmd = [chrome, mode, "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage",
+               "--no-pdf-header-footer", "--print-to-pdf-no-header",
+               "--virtual-time-budget=3000", f"--print-to-pdf={pdf_path}", url]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=240)
+        except Exception as e:
+            log.warning("اجرای Chrome برای PDF شکست: %s", e)
+            continue
+        if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1000:
+            return True
+        log.warning("PDF با %s ساخته نشد: %s", mode, (r.stderr or b"")[-200:].decode(errors="ignore"))
+    return False
+
+
+def build_html(path, summary, top_parts, top_combos, parts, combos, brands, prepared, hints):
+    E = html.escape
+    fa = lambda x: str(x).translate(FA_DIGITS)
+
+    def table(headers, rows, cls=""):
+        h = "".join(f"<th>{E(str(x))}</th>" for x in headers)
+        body = "".join("<tr>" + "".join(f"<td>{E(str(c))}</td>" for c in row) + "</tr>" for row in rows)
+        return f'<table class="{cls}"><thead><tr>{h}</tr></thead><tbody>{body}</tbody></table>'
+
+    def hint(cat):
+        return "، ".join(hints.get(cat, [])) or "—"
+
+    cards = [
+        ("پست فروشنده با نام قطعه", summary["posts_seller"]),
+        ("پست خبری", summary["posts_news"]),
+        ("پست خوانده‌شده", summary["posts_scanned"]),
+        ("کانال فروشنده", summary["channels"]),
+        ("قطعهٔ دیده‌شده", f'{summary["parts_with_hits"]} از {summary["parts_total"]}'),
+        ("ترکیب دیده‌شده", f'{summary["combos_with_hits"]} از {summary["combos_total"]}'),
+        ("بازدید پست‌های فروشنده", summary["views_seller"]),
+        ("برند دیده‌شده", summary["brands_observed"]),
+    ]
+    cards_html = "".join(f'<div class="card"><div class="k">{E(k)}</div><div class="v">{E(fa(v))}</div></div>'
+                         for k, v in cards)
+
+    part_rows = [[fa(i), p[0], p[1], fa(p[2]), fa(p[3]), fa(p[5]), fa(p[6]), p[9], hint(p[1])]
+                 for i, p in enumerate(top_parts, 1)]
+    combo_rows = [[fa(i), c[0], c[2], fa(c[5]), fa(c[6]), fa(c[9]), c[14], c[4]]
+                  for i, c in enumerate(top_combos, 1)]
+    all_combo_rows = [[fa(i), c[0], c[1], c[2], fa(c[5]), fa(c[6]), fa(c[8]), fa(c[9]), c[14], c[4]]
+                      for i, c in enumerate(combos[:500], 1)]
+    all_part_rows = [[fa(i), p[0], p[1], fa(p[2]), fa(p[3]), fa(p[5]), fa(p[6]), p[9], hint(p[1])]
+                     for i, p in enumerate([p for p in parts], 1)]
+    brand_rows = [[b, fa(n), fa(np), fa(v), "بله" if b in prepared else "—", plist or "—"]
+                  for b, n, np, v, plist in brands]
+    hint_rows = [[cat, "، ".join(bs)] for cat, bs in hints.items()]
+    prep = "، ".join(prepared)
+
+    doc = f"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<title>آمار تقاضای قطعات یدکی خودرو</title>
+<style>
+@page {{ size: A4; margin: 12mm 9mm; }}
+* {{ box-sizing: border-box; }}
+body {{ font-family: Tahoma, "DejaVu Sans", "Noto Naskh Arabic", sans-serif; color:#111827;
+        font-size: 9.5px; line-height: 1.6; }}
+h1 {{ font-size: 19px; margin: 0 0 2px; }}
+h2 {{ font-size: 13px; margin: 16px 0 6px; padding-bottom: 3px; border-bottom: 2px solid #0f766e;
+      color:#0f766e; page-break-after: avoid; }}
+.sub {{ color:#4b5563; font-size: 10px; margin-bottom: 10px; }}
+.cards {{ display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0 4px; }}
+.card {{ border:1px solid #d1d5db; border-radius: 5px; padding: 4px 8px; min-width: 108px;
+         background:#f8fafc; }}
+.card .k {{ color:#6b7280; font-size: 8.5px; }}
+.card .v {{ font-weight: bold; font-size: 13px; color:#0f766e; }}
+table {{ width: 100%; border-collapse: collapse; margin: 4px 0 10px; font-size: 8px; }}
+thead {{ display: table-header-group; }}
+tr {{ page-break-inside: avoid; }}
+th, td {{ border: 1px solid #d1d5db; padding: 2px 3px; text-align: right; vertical-align: top; }}
+th {{ background: #e5e7eb; font-size: 8px; }}
+tbody tr:nth-child(even) {{ background: #f9fafb; }}
+.note {{ background:#fffbeb; border:1px solid #fcd34d; border-radius:5px; padding:6px 8px;
+         font-size:9px; margin:6px 0; }}
+ol, ul {{ margin: 4px 18px 8px 0; padding: 0; }}
+li {{ margin-bottom: 2px; }}
+.footer {{ margin-top: 14px; border-top:1px solid #d1d5db; padding-top:4px; color:#6b7280; font-size: 8px; }}
+</style></head><body>
+<h1>آمار تاریخی تقاضای قطعات یدکی خودرو</h1>
+<div class="sub">بازه: <span dir="ltr">{E(summary['first'])}</span> تا <span dir="ltr">{E(summary['last'])}</span> — قطعات خودروهای سواری و وانت — تولید: <span dir="ltr">{E(fmt_ts(time.time()))}</span></div>
+<div class="cards">{cards_html}</div>
+
+<h2>۳۰ قطعهٔ پرتکرار در کانال فروشندگان</h2>
+{table(["#", "قطعه", "دسته", "پست", "۹۰ روز", "کانال", "بازدید", "برندهای دیده‌شده", "برندهای پیشنهادی بازار"], part_rows)}
+
+<h2>۳۰ ترکیب پرتکرار قطعه×خودرو</h2>
+{table(["#", "قطعه", "خودرو", "پست", "۹۰ روز", "بازدید", "برندهای دیده‌شده", "برندهای پیشنهادی بازار"], combo_rows)}
+
+<h2>برندها (دیده‌شده و فهرست آماده)</h2>
+{table(["برند", "پست", "قطعه", "بازدید", "در فهرست آماده", "قطعه‌های دیده‌شده"], brand_rows)}
+<p class="note">برندهای فهرست آماده: {E(prep)}<br>
+برندهایی که در پست‌ها دیده نشده‌اند با صفر آمده‌اند تا فهرست کامل بماند.</p>
+{table(["دسته", "برندهای پیشنهادی"], hint_rows)}
+
+<h2>۵۰۰ ترکیب اول (کامل، با برند)</h2>
+{table(["#", "قطعه", "دسته", "خودرو", "پست", "۹۰ روز", "کانال", "بازدید", "برندهای دیده‌شده", "برندهای پیشنهادی بازار"], all_combo_rows)}
+
+<h2>همهٔ قطعه‌ها</h2>
+{table(["#", "قطعه", "دسته", "پست", "۹۰ روز", "کانال", "بازدید", "برندهای دیده‌شده", "برندهای پیشنهادی بازار"], all_part_rows)}
+
+<h2>روش</h2>
+<ol>
+<li>صفحهٔ عمومی هر کانال (<code>t.me/s/&lt;name&gt;</code>) با <code>?before=</code> تا تاریخ برش عقب می‌رود.</li>
+<li>در متن هر پست، نام قطعه/خودرو/برند با تطبیق واژه‌ای (طولانی‌ترین نام اول) پیدا می‌شود؛ برندهای «پیشنهادی بازار» از فهرست آمادهٔ هر دسته می‌آیند.</li>
+<li>جدول ترکیبی از هم‌رخدادی ساخته می‌شود: هر پست با نام قطعه و خودرو، برای هر جفت یک‌بار شمرده می‌شود.</li>
+<li>بازدید از پیش‌نمایش تلگرام خوانده می‌شود؛ مجموعش شاخص دیده‌شدن است، نه تعداد خرید.</li>
+<li>کانال‌های فروشنده منبع اصلی‌اند؛ کانال‌های خبری فقط ستون جداگانه دارند.</li>
+</ol>
+
+<h2>محدودیت‌ها</h2>
+<ul>
+<li>نرخ کلیک گوگل قابل‌اندازه‌گیری نیست؛ این گزارش «فراوانی نام قطعه در محتوای عمومی» است.</li>
+<li>فقط پست‌های متنی شمرده می‌شوند؛ کانال خصوصی و پست عکس‌محور بیرون‌اند.</li>
+<li>فروشنده بیشتر از خریدار حرف می‌زند؛ عدد = شدت عرضه/مکالمهٔ بازار که با تقاضا همبسته است.</li>
+<li>برند فقط وقتی ثبت می‌شود که در همان پست کنار نام قطعه آمده باشد؛ ستون «برندهای پیشنهادی بازار» تعمیم دسته است، نه مشاهده.</li>
+</ul>
+<div class="footer">پروژهٔ parts-demand — {E(fa(summary['posts'] or 0))} پست یکتا، {E(fa(summary['channels']))} کانال فروشنده</div>
+</body></html>"""
+    open(path, "w", encoding="utf-8").write(doc)
+    return path
 
 
 def report(args):
@@ -439,11 +610,13 @@ def report(args):
             else (0, 0, 0, 0, None, None, 0)
         combos.append([c["part"], c["cat"], c["vehicle"], c["models"], c["brand_hint"],
                        sa, s90, na, chs, vs, fmt_ts(first), fmt_ts(last),
-                       c["spec"], r["sample"].get(c["part"], "")])
+                       c["spec"], r["sample"].get(c["part"], ""),
+                       "، ".join(r["combo_brands"].get((c["part"], c["vehicle"]), [])[:4]) or "—"])
     combos.sort(key=lambda x: (-x[5], -x[9], -x[6], x[0]))
     header = ["رتبه", "قطعه", "دسته", "خودرو", "مدل‌ها", "برندهای رایج بازار",
               "پست فروشندگان", "همان در ۹۰ روز", "پست خبری", "کانال فروشنده",
-              "مجموع بازدید", "اولین‌بار", "آخرین‌بار", "مشخصات", "نمونه لینک"]
+              "مجموع بازدید", "اولین‌بار", "آخرین‌بار", "مشخصات", "نمونه لینک",
+              "برندهای دیده‌شده (تعداد)"]
     rows = [[i] + row for i, row in enumerate(combos, 1)]
     write_csv(os.path.join(OUT_DIR, "parts_frequency.csv"), header, rows)
     write_csv(os.path.join(OUT_DIR, "top%d.csv" % args.top), header, rows[:args.top])
@@ -481,10 +654,22 @@ def report(args):
     total_posts, n_ch, first_ts, last_ts, s_posts, n_posts, scanned = r["coverage"]
     hit_combos = sum(1 for c in combos if c[5] > 0)
     hit_parts = sum(1 for p in parts if p[2] > 0)
+    prepared = cat.get("brands", [])
+    r_hints = cat.get("brand_hints", {})
+    brand_table, seen_brands = [], set()
+    for b, n, nparts, plist in r["brand_totals"]:
+        brand_table.append([b, n, nparts, r["brand_views"].get(b, 0), plist])
+        seen_brands.add(b)
+    for b in prepared:
+        if b not in seen_brands:
+            brand_table.append([b, 0, 0, 0, ""])
+    brand_table.sort(key=lambda x: (-x[1], x[0]))
     summary = {"posts": total_posts or 0, "posts_seller": s_posts or 0, "posts_news": n_posts or 0,
                "channels": n_ch, "first": fmt_ts(first_ts), "last": fmt_ts(last_ts),
                "posts_scanned": scanned or 0, "combos_total": len(combos), "combos_with_hits": hit_combos,
                "parts_total": len(parts), "parts_with_hits": hit_parts,
+               "brands_observed": len(seen_brands), "brands_prepared": len(prepared),
+               "top_brands": [[b, n] for b, n, nparts, views, plist in brand_table if n > 0][:5],
                "mentions_seller": sum(p[2] for p in parts), "views_seller": sum(p[6] for p in parts)}
     json.dump(summary, open(os.path.join(OUT_DIR, "summary.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=1)
@@ -502,15 +687,26 @@ def report(args):
           f"- ترکیب‌های قطعه×خودروی دیده‌شده: {fa(hit_combos)} از {fa(len(combos))}",
           f"- مجموع بازدید پست‌های فروشندگان: {fa(summary['views_seller'])}", "",
           "## ۳۰ قطعهٔ پرتکرار در کانال فروشندگان", "",
-          "| # | قطعه | دسته | پست | ۹۰ روز | کانال | بازدید | برندهای دیده‌شده |",
-          "|---|------|------|-----|--------|-------|--------|------------------|"]
+          "| # | قطعه | دسته | پست | ۹۰ روز | کانال | بازدید | برندهای دیده‌شده | برندهای پیشنهادی بازار |",
+          "|---|------|------|-----|--------|-------|--------|------------------|------------------------|"]
     for i, p in enumerate(top_parts, 1):
-        md.append(f"| {fa(i)} | {p[0]} | {p[1]} | {fa(p[2])} | {fa(p[3])} | {fa(p[5])} | {fa(p[6])} | {p[9]} |")
+        md.append(f"| {fa(i)} | {p[0]} | {p[1]} | {fa(p[2])} | {fa(p[3])} | {fa(p[5])} | {fa(p[6])} | {p[9]} | "
+                  f"{'، '.join(r_hints.get(p[1], [])) or '—'} |")
     md += ["", "## ۳۰ ترکیب پرتکرار قطعه×خودرو (فروشندگان)", "",
-           "| # | قطعه | خودرو | پست | ۹۰ روز | بازدید | برندهای رایج |",
-           "|---|------|-------|-----|--------|--------|--------------|"]
+           "| # | قطعه | خودرو | پست | ۹۰ روز | بازدید | برندهای دیده‌شده | برندهای پیشنهادی بازار |",
+           "|---|------|-------|-----|--------|--------|------------------|------------------------|"]
     for i, c in enumerate(top_combos, 1):
-        md.append(f"| {fa(i)} | {c[0]} | {c[2]} | {fa(c[5])} | {fa(c[6])} | {fa(c[9])} | {c[4]} |")
+        md.append(f"| {fa(i)} | {c[0]} | {c[2]} | {fa(c[5])} | {fa(c[6])} | {fa(c[9])} | {c[14]} | {c[4]} |")
+    md += ["", "## برندها (دیده‌شده و فهرست آماده)", "",
+           "| برند | پست | قطعه | بازدید | در فهرست آماده | قطعه‌های دیده‌شده |",
+           "|------|-----|------|--------|----------------|------------------|"]
+    for b, n, nparts, views, plist in brand_table:
+        md.append(f"| {b} | {fa(n)} | {fa(nparts)} | {fa(views)} | "
+                  f"{'بله' if b in prepared else '—'} | {plist or '—'} |")
+    md += ["", "برندهای فهرست آماده: " + "، ".join(prepared)]
+    md += ["", "| دسته | برندهای پیشنهادی |", "|------|------------------|"]
+    for cat_name, bs in r_hints.items():
+        md.append(f"| {cat_name} | {'، '.join(bs)} |")
     md += ["", "## روش", "",
            "1. صفحهٔ عمومی هر کانال (`t.me/s/<name>`) با `?before=` تا تاریخ برش عقب می‌رود.",
            "2. در متن هر پست، نام قطعه/خودرو/برند با تطبیق واژه‌ای (طولانی‌ترین نام اول) پیدا می‌شود.",
@@ -529,6 +725,15 @@ def report(args):
            "- پوشش یک سال به حجم کانال بستگی دارد؛ اگر `--pages` کم باشد، کانال‌های پرحجم فقط بخشی از سال را می‌دهند.",
            ""]
     open(os.path.join(OUT_DIR, "report.md"), "w", encoding="utf-8").write("\n".join(md))
+
+    html_path = os.path.join(OUT_DIR, "report.html")
+    build_html(html_path, summary, top_parts, top_combos, parts, combos, brand_table,
+               prepared, r_hints)
+    pdf_path = os.path.join(OUT_DIR, "report.pdf")
+    if make_pdf(html_path, pdf_path):
+        log.info("PDF نوشته شد: %s", pdf_path)
+    else:
+        log.warning("PDF ساخته نشد؛ HTML در %s هست", html_path)
     log.info("گزارش نوشته شد: %s (پست فروشنده=%d، ترکیب دیده‌شده=%d از %d)",
              OUT_DIR, s_posts or 0, hit_combos, len(combos))
     return summary, top_parts, top_combos
@@ -603,12 +808,15 @@ def digest(args):
              "", "۱۵ قطعهٔ پرتکرار در بازار:"]
     for i, p in enumerate([p for p in top_parts if p[2] > 0][:15], 1):
         lines.append(f"{fa(i)}. {p[0]} — {fa(p[2])} پست ({fa(p[3])} در ۹۰ روز)")
-    lines += ["", "فایل‌های کامل در پیام‌های بعدی."]
+    tb = summary.get("top_brands") or []
+    if tb:
+        lines += ["", "برندهای پرتکرار: " + "، ".join(f"{b} ({fa(n)})" for b, n in tb)]
+    lines += ["", "گزارش کامل (PDF) و جدول‌ها در پیام‌های بعدی."]
     ok = send("\n".join(lines))
     sent = 0
-    for name, cap in (("top500.csv", "۵۰۰ ترکیب پرتقاضا"),
-                      ("parts_frequency.csv", "ماتریس کامل ترکیب‌ها"),
-                      ("report.md", "گزارش خوانا")):
+    for name, cap in (("report.pdf", "گزارش کامل (PDF)"),
+                      ("top500.csv", "۵۰۰ ترکیب پرتقاضا"),
+                      ("parts_frequency.csv", "ماتریس کامل ترکیب‌ها")):
         if send_document(os.path.join(OUT_DIR, name), f"{cap} — {fmt_ts(time.time())}"):
             sent += 1
         time.sleep(1.0)
