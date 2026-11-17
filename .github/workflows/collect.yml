@@ -1,0 +1,128 @@
+name: آمار تقاضای قطعات
+
+on:
+  schedule:
+    # اجرای روزانه: برداشت افزایشی ۳۰ روز اخیر
+    - cron: "10 4 * * *"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "بازه‌ی بازگشت به عقب (روز)"
+        default: "365"
+      pages:
+        description: "حداکثر صفحه در هر کانال (هر صفحه ~۲۰ پست)"
+        default: "40"
+  # backstop: هر تغییر واقعی در منابع یا کد همان لحظه یک دور کامل می‌زند
+  push:
+    branches: [main]
+    paths:
+      - "collector.py"
+      - "catalog_seed.json"
+      - "channels.txt"
+      - "news.txt"
+      - ".github/workflows/collect.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: parts-demand
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --no-cache-dir -r requirements.txt
+
+      - name: بازیابی پایگاه داده‌ی دورهای قبل
+        run: |
+          mkdir -p data
+          if git ls-remote --exit-code --heads origin state >/dev/null 2>&1; then
+            git fetch -q --depth 1 origin +refs/heads/state:refs/remotes/origin/state
+            git show refs/remotes/origin/state:data/parts.db > data/parts.db || rm -f data/parts.db
+          fi
+          rm -f data/parts.db-wal data/parts.db-shm
+
+      - name: تعیین بازه‌ی اجرا
+        env:
+          INPUT_DAYS: ${{ github.event.inputs.days }}
+          INPUT_PAGES: ${{ github.event.inputs.pages }}
+        run: |
+          if [ -n "$INPUT_DAYS" ]; then
+            days="$INPUT_DAYS"; pages="${INPUT_PAGES:-40}"
+          elif ! git ls-remote --exit-code --heads origin state >/dev/null 2>&1; then
+            days=365; pages=40   # اولین اجرا: ساخت پایه‌ی یک‌ساله
+          elif [ "$(date -u +%d)" = "01" ]; then
+            days=365; pages=40   # اجرای کامل ماهانه
+          else
+            days=30; pages=10    # برداشت افزایشی روزانه
+          fi
+          echo "DAYS=$days" >> "$GITHUB_ENV"
+          echo "PAGES=$pages" >> "$GITHUB_ENV"
+          echo "این دور: days=$days pages=$pages"
+
+      - name: ساخت کاتالوگ و تست تطبیق نام‌ها
+        run: |
+          python build_catalog.py
+          python collector.py selftest
+
+      - name: برداشت از کانال‌ها
+        env:
+          WORKERS: "3"
+          MAX_RUNTIME: "2100"  # کمتر از timeout کار تا ذخیره‌ی وضعیت جا داشته باشد
+        run: python -u collector.py collect --days "$DAYS" --pages "$PAGES"
+
+      - name: استخراج دوباره و ساخت جدول‌ها
+        run: |
+          python collector.py rebuild
+          python collector.py report --top 500
+
+      - name: ارسال خلاصه به تلگرام
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python collector.py digest
+
+      - name: نگه‌داشتن خروجی‌ها
+        uses: actions/upload-artifact@v4
+        with:
+          name: parts-report-${{ github.run_number }}
+          path: out/
+          retention-days: 90
+
+      - name: ذخیره‌ی پایگاه داده روی شاخه‌ی state
+        if: always()
+        env:
+          GIT_TOKEN: ${{ secrets.STATE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          if [ ! -f data/parts.db ]; then echo "پایگاه داده‌ای ساخته نشد"; exit 0; fi
+          python - <<'EOF'
+          import sqlite3
+          c = sqlite3.connect("data/parts.db")
+          c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+          c.close()
+          EOF
+          cp data/parts.db /tmp/parts.db
+          git remote set-url origin "https://x-access-token:${GIT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin +refs/heads/state:refs/remotes/origin/state || true
+          if git rev-parse --verify -q refs/remotes/origin/state >/dev/null; then
+            git checkout -q -B state refs/remotes/origin/state
+          else
+            git checkout -q --orphan state
+          fi
+          mkdir -p data
+          cp /tmp/parts.db data/parts.db
+          git config user.name "parts-demand"
+          git config user.email "parts-demand@users.noreply.github.com"
+          git add -f data/parts.db
+          git diff --cached --quiet || git commit -q -m "پایگاه داده‌ی تقاضای قطعات"
+          git push -q origin HEAD:state

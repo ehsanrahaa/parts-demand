@@ -1,0 +1,46 @@
+# کانال‌های عمومی تلگرام — هر خط یک نام، بدون @ و بدون https://t.me/
+# نام‌ها در ۲۰۲۶-۱۱-۱۶/۱۷ تست شده‌اند: صفحهٔ عمومی باز می‌شود و پست متنی دارند.
+# برای افزودن کانال تازه: نامش را اضافه کنید و `python collector.py probe` بزنید.
+
+# --- فروشندگان و پخش‌کنندگان قطعات (منبع اصلی) ---
+Iranianautopartssuppliers
+rscoshop
+yadakbazar
+saeeedyadak
+tspareparts
+yadakisabouri
+hedarieahmad321
+
+# --- کشف‌شده از کانال فهرست «بانک کانال‌های بازار لوازم یدکی» (chanellbazar) و تست زنده ---
+safibenzinamg
+jahanbelt
+wiresparkline
+bahador_240
+estart_dinam
+pakhshyadakfarid
+arabispreadparts
+temelsaberi
+bazarganisaeidzadeh
+parsandish56
+aarkaapart
+jampartofficial
+shirzadstorei
+ghafasehbazar
+germanpart_kfz
+omdeautopart
+iace_eiffel_autoparts
+indosaan
+ashtianibearngs
+modernlights1
+rahimibarghi
+vtparsian
+mtsco
+pakhshecheraghekhodro1
+iautoparts_Archive
+bonyade12345
+stockmapsensor
+saberiyadak
+pridyadak
+phaetonghate
+
+# کانال‌های خبری خودرو در news.txt هستند (ستون جداگانه در گزارش).
