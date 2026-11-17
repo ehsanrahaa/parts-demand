@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import sqlite3
+import statistics
 import subprocess
 import sys
 import time
@@ -58,7 +59,7 @@ UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, 
 FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 
 # ---------- متن ----------
-TR = str.maketrans({"‌": " ", "ي": "ی", "ك": "ک", "ة": "ه", "ـ": "", "ﻻ": "لا",
+TR = str.maketrans({"‌": " ", "ي": "ی", "ك": "ک", "ة": "ه", "ـ": "", "ﻻ": "لا", "٫": ".",
                     "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4", "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9"})
 
 
@@ -120,6 +121,67 @@ def match_terms(rx, term_map, text):
     return hits
 
 
+# ---------- قیمت ----------
+# فقط قیمت‌های صریحِ متن. قیمتی که فروشنده در عکس می‌گذارد خوانده نمی‌شود (در README هم آمده).
+PRICE_NUM = r"(?<![\d/])(\d{1,3}(?:[,\s/]\d{3})+|\d+(?:[.,]\d+)?)"
+PRICE_UNIT = re.compile(PRICE_NUM + r"\s*(میلیون|هزار)?\s*(تومان|تومن|ریال|ت)(?=$|[\s,،.؛:)\-])")
+PRICE_BARE = re.compile(r"قیمت[^\d]{0,15}" + PRICE_NUM)
+
+
+def _amount(raw, mult):
+    try:
+        if mult > 1:
+            return float(raw.replace("/", ".").replace(",", "")) * mult
+        return float(re.sub(r"[,/\s]", "", raw))
+    except ValueError:
+        return None
+
+
+def parse_prices(text):
+    """[(تومان, start, end)] — ریال به تومان تبدیل می‌شود؛ محدودهٔ معقول قیمت قطعه نگه داشته می‌شود."""
+    t = norm(text)
+    out = []
+    for m in PRICE_UNIT.finditer(t):
+        mult = 1000 if m.group(2) == "هزار" else 1000000 if m.group(2) == "میلیون" else 1
+        n = _amount(m.group(1), mult)
+        if n is None:
+            continue
+        if m.group(3) == "ریال":
+            n /= 10
+        if 50000 <= n <= 500000000:
+            out.append((int(n), m.start(), m.end()))
+    for m in PRICE_BARE.finditer(t):
+        if any(a <= m.start() < b for _, a, b in out):
+            continue
+        n = _amount(m.group(1), 1)
+        if n and 100000 <= n <= 500000000:
+            out.append((int(n), m.start(1), m.end(1)))
+    return out
+
+
+def _dist(s, e, a, b):
+    """فاصلهٔ دو بازهٔ متنی؛ صفر یعنی هم‌پوشان."""
+    return 0 if (a <= s < b or s <= a < e) else min(abs(s - b), abs(a - e))
+
+
+def _write_prices(db, ppos, vpos, brands, pid, channel, kind, ts, text, post_vehicle):
+    """هر قیمت به نزدیک‌ترین نام قطعه در همان پست نسبت داده می‌شود (تا ۲۰۰ کاراکتر فاصله)."""
+    if not ppos:
+        return
+    brand = next(iter(brands.values())) if len(brands) == 1 else ""
+    for amount, s, e in parse_prices(text):
+        near = min(ppos, key=lambda p: _dist(s, e, p[0], p[1]))
+        if _dist(s, e, near[0], near[1]) > 200:
+            continue
+        veh = post_vehicle
+        if not veh and vpos:
+            nv = min(vpos, key=lambda v: _dist(s, e, v[0], v[1]))
+            if _dist(s, e, nv[0], nv[1]) <= 80:
+                veh = nv[2]
+        db.execute("INSERT OR IGNORE INTO prices VALUES(?,?,?,?,?,?,?,?)",
+                   (pid, near[2], veh, brand, ts, channel, amount, kind))
+
+
 # ---------- دیتابیس ----------
 def open_db(path=None):
     path = path or DB_PATH
@@ -144,8 +206,19 @@ def open_db(path=None):
         id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL, days INTEGER, channels INTEGER,
         posts_scanned INTEGER, posts_with_parts INTEGER, new_posts INTEGER,
         oldest REAL, newest REAL);
+    -- قیمت‌های صریحِ متن پست (تومان/ریال) که به نزدیک‌ترین قطعه نسبت داده شده‌اند.
+    CREATE TABLE IF NOT EXISTS prices(
+        post_id TEXT, part TEXT, vehicle TEXT, brand TEXT, ts REAL, channel TEXT,
+        amount INTEGER, kind TEXT, PRIMARY KEY(post_id, part, amount));
+    -- عکس روزانه از بازدید و تعداد پست هر قطعه؛ اختلاف دو روز = نرخ توجه در آن روز.
+    CREATE TABLE IF NOT EXISTS signals(
+        day TEXT, part TEXT, posts INTEGER DEFAULT 0, views INTEGER DEFAULT 0,
+        PRIMARY KEY(day, part));
+    CREATE TABLE IF NOT EXISTS alerts(
+        key TEXT PRIMARY KEY, ts REAL, note TEXT);
     CREATE INDEX IF NOT EXISTS idx_mentions_part ON mentions(part, ts);
     CREATE INDEX IF NOT EXISTS idx_mentions_veh ON mentions(vehicle, ts);
+    CREATE INDEX IF NOT EXISTS idx_prices_part ON prices(part, ts);
     """)
     return conn
 
@@ -280,7 +353,16 @@ def load_channels(args):
 
 # ---------- برداشت ----------
 def _write_mentions(db, rx, term_map, cat, pid, channel, kind, ts, url, text, views):
-    hits = match_terms(rx, term_map, norm(text))
+    t = norm(text)
+    hits = {"part": {}, "vehicle": {}, "brand": {}}
+    ppos, vpos = [], []
+    for m in rx.finditer(t):
+        k, key, name = term_map[m.lastgroup]
+        hits[k][key] = name
+        if k == "part":
+            ppos.append((m.start(), m.end(), name))
+        elif k == "vehicle":
+            vpos.append((m.start(), m.end(), name))
     parts, vehicles, brands = hits["part"], hits["vehicle"], hits["brand"]
     vehicle = next(iter(vehicles.values())) if len(vehicles) == 1 else ""
     cat_of = {p["key"]: p["cat"] for p in cat["parts"]}
@@ -292,6 +374,7 @@ def _write_mentions(db, rx, term_map, cat, pid, channel, kind, ts, url, text, vi
         for vname in vehicles.values():
             db.execute("INSERT OR IGNORE INTO pairs VALUES(?,?,?,?,?,?,?)",
                        (pid, pname, vname, ts, channel, kind, views))
+    _write_prices(db, ppos, vpos, brands, pid, channel, kind, ts, text, vehicle)
     return parts
 
 
@@ -306,7 +389,7 @@ def ingest(db, rx, term_map, cat, channel, kind, url, ts, text, views):
                 db.execute(f"UPDATE {t} SET views=? WHERE post_id=?", (views, pid))
         if len(text) > old[0]:
             db.execute("UPDATE posts SET text=? WHERE id=?", (text[:20000], pid))
-            for t in ("mentions", "brand_mentions", "pairs"):
+            for t in ("mentions", "brand_mentions", "pairs", "prices"):
                 db.execute(f"DELETE FROM {t} WHERE post_id=?", (pid,))
             _write_mentions(db, rx, term_map, cat, pid, channel, kind, ts, url, text, views)
         return False
@@ -322,7 +405,7 @@ def rebuild(args):
     cat = load_catalog()
     rx, term_map = build_matchers(cat)
     db = open_db()
-    for t in ("mentions", "brand_mentions", "pairs"):
+    for t in ("mentions", "brand_mentions", "pairs", "prices"):
         db.execute(f"DELETE FROM {t}")
     n = 0
     for pid, channel, kind, ts, url, text, views in db.execute(
@@ -383,6 +466,212 @@ def collect(args):
 # ---------- گزارش ----------
 def fmt_ts(ts):
     return time.strftime("%Y-%m-%d", time.gmtime(ts)) if ts else "—"
+
+
+def fa_num(n):
+    try:
+        return f"{int(round(n)):,}".replace(",", "٬").translate(FA_DIGITS)
+    except (TypeError, ValueError):
+        return "—"
+
+
+def fa_pct(v):
+    if v is None:
+        return "—"
+    return ("▲" if v > 0 else "▼" if v < 0 else "■") + fa_num(abs(v)) + "٪"
+
+
+# ---------- سیگنال بازار ----------
+def price_board(db, span_days=120):
+    """آخرین قیمت ثبت‌شدهٔ هر قطعه، تغییر نسبت به قیمت قبلی و نسبت به ۲۴ ساعت قبل."""
+    now = time.time()
+    rows = db.execute("""SELECT part, vehicle, brand, ts, amount, channel FROM prices
+                         WHERE kind='seller' AND ts>=? ORDER BY ts""",
+                      (now - span_days * 86400,)).fetchall()
+    by = {}
+    for part, veh, brand, ts, amount, ch in rows:
+        by.setdefault(part, []).append({"ts": ts, "amount": amount, "vehicle": veh or "",
+                                        "brand": brand or "", "channel": ch})
+    demand = dict(db.execute("""SELECT part, COUNT(DISTINCT post_id) FROM mentions
+                                WHERE kind='seller' AND ts>=? GROUP BY part""",
+                             (now - 7 * 86400,)).fetchall())
+    board = []
+    for part, obs in by.items():
+        # یک قیمت در روز برای هر خودرو (میانه) تا چند قیمتِ یک لیست، «تغییر» جعلی نسازد.
+        daily = {}
+        for o in obs:
+            daily.setdefault((o["vehicle"], int(o["ts"] // 86400)), []).append(o)
+        vehs = {}
+        for (veh, day), lst in daily.items():
+            lst.sort(key=lambda x: x["ts"])
+            med = int(statistics.median(x["amount"] for x in lst))
+            vehs.setdefault(veh, []).append({"day": day, "amount": med, "ts": lst[-1]["ts"],
+                                             "brand": lst[-1]["brand"]})
+        veh = max(vehs, key=lambda k: vehs[k][-1]["ts"])
+        seq = sorted(vehs[veh], key=lambda x: x["day"])
+        last = seq[-1]
+        prev = seq[-2] if len(seq) > 1 else None
+        chg = None
+        if prev and prev["amount"]:
+            chg = (last["amount"] - prev["amount"]) / prev["amount"] * 100
+            if abs(chg) > 60:  # جابه‌جایی مدل/برند یا نادرست‌خواندن؛ سیگنال نیست
+                chg = None
+        day_chg = None
+        if prev and last["day"] - prev["day"] == 1 and prev["amount"]:
+            day_chg = (last["amount"] - prev["amount"]) / prev["amount"] * 100
+        win = [x["amount"] for x in seq if x["day"] >= int((now - 30 * 86400) // 86400)] or [x["amount"] for x in seq]
+        board.append({"part": part, "vehicle": veh, "brand": last["brand"],
+                      "last": last["amount"], "last_ts": last["ts"],
+                      "prev": prev["amount"] if prev else None,
+                      "prev_ts": prev["ts"] if prev else None, "chg": chg, "day": day_chg,
+                      "lo": min(win), "hi": max(win), "med": statistics.median(win),
+                      "n": len(obs), "demand": demand.get(part, 0)})
+    board.sort(key=lambda r: (-r["demand"], -r["last_ts"]))
+    return board, demand
+
+
+def _window_counts(db, sql, days):
+    now = time.time()
+    a = now - days * 86400
+    b = a - days * 86400
+    rows = db.execute(sql, (a, a, b)).fetchall()
+    out = []
+    for name, cu, pr in rows:
+        pct = (cu - pr) / pr * 100 if pr else (100 if cu else 0)
+        state = "داده کم" if cu + pr < 3 else ("صعودی" if pct >= 15 else "نزولی" if pct <= -15 else "ثابت")
+        out.append({"name": name, "cur": cu, "prev": pr, "pct": pct, "state": state})
+    out.sort(key=lambda r: (-r["cur"], r["name"]))
+    return out
+
+
+def market_moves(db, days=7):
+    """قطعه‌ها: هفت روز اخیر در برابر هفت روز قبل از آن."""
+    return _window_counts(db, """
+        SELECT part,
+          COUNT(DISTINCT CASE WHEN ts>=? THEN post_id END),
+          COUNT(DISTINCT CASE WHEN ts<? THEN post_id END)
+        FROM mentions WHERE kind='seller' AND ts>=? GROUP BY part""", days)
+
+
+def combo_moves(db, days=7):
+    return _window_counts(db, """
+        SELECT part || '×' || vehicle,
+          COUNT(DISTINCT CASE WHEN ts>=? THEN post_id END),
+          COUNT(DISTINCT CASE WHEN ts<? THEN post_id END)
+        FROM pairs WHERE kind='seller' AND ts>=? GROUP BY part, vehicle""", days)
+
+
+def brand_moves(db, days=7):
+    return _window_counts(db, """
+        SELECT b.brand,
+          COUNT(DISTINCT CASE WHEN p.ts>=? THEN b.post_id END),
+          COUNT(DISTINCT CASE WHEN p.ts<? THEN b.post_id END)
+        FROM brand_mentions b JOIN posts p ON p.id=b.post_id
+        WHERE p.kind='seller' AND p.ts>=? GROUP BY b.brand""", days)
+
+
+def take_snapshot(db):
+    """عکس روزانه از بازدید تجمعی و تعداد پست هر قطعه؛ اختلاف دو روز = نرخ توجه."""
+    day = fmt_ts(time.time())
+    rows = db.execute("""SELECT part, COUNT(DISTINCT post_id), SUM(views)
+                         FROM mentions WHERE kind='seller' GROUP BY part""").fetchall()
+    for part, posts, views in rows:
+        db.execute("""INSERT INTO signals(day, part, posts, views) VALUES(?,?,?,?)
+                      ON CONFLICT(day, part) DO UPDATE SET
+                        posts=MAX(posts, excluded.posts), views=MAX(views, excluded.views)""",
+                   (day, part, posts or 0, views or 0))
+    db.commit()
+
+
+def attention_rates(db):
+    """آخرین رشد بازدید هر قطعه و پایهٔ روزهای قبل (فقط وقتی حداقل دو روز عکس داریم)."""
+    days = [d for (d,) in db.execute("SELECT DISTINCT day FROM signals ORDER BY day DESC LIMIT 8")]
+    if len(days) < 2:
+        return {}
+    by = {}
+    for day, part, views in db.execute("SELECT day, part, views FROM signals WHERE day>=?",
+                                       (min(days),)).fetchall():
+        by.setdefault(part, []).append((day, views))
+    rates = {}
+    for part, seq in by.items():
+        seq.sort()
+        if len(seq) < 2:
+            continue
+        deltas = [seq[i][1] - seq[i - 1][1] for i in range(1, len(seq))]
+        last = deltas[-1]
+        base = sum(deltas[:-1]) / len(deltas[:-1]) if len(deltas) > 1 else 0
+        rates[part] = {"views_delta": last, "views_base": base}
+    return rates
+
+
+def detect_alerts(db):
+    """مواردی که در ۲۴ ساعت اخیر از پایهٔ خودشان معنادار بالاتر رفته‌اند (بدون علامت‌زدن)."""
+    now = time.time()
+    cur = dict(db.execute("""SELECT part, COUNT(DISTINCT post_id) FROM mentions
+                             WHERE kind='seller' AND ts>=? GROUP BY part""",
+                          (now - 86400,)).fetchall())
+    base_rows = db.execute("""SELECT part, COUNT(DISTINCT post_id) FROM mentions
+                              WHERE kind='seller' AND ts>=? AND ts<? GROUP BY part""",
+                           (now - 15 * 86400, now - 86400)).fetchall()
+    base = {p: c / 14.0 for p, c in base_rows}
+    rates = attention_rates(db)
+    board, _ = price_board(db)
+    day = fmt_ts(now)
+    items = []
+    for part, c in cur.items():
+        b = base.get(part, 0.0)
+        if c >= 3 and c >= max(2 * b, 2.5):
+            items.append({"part": part, "kind": "حجم پست", "key": f"{day}|{part}|posts",
+                          "line": f"• {part}: {fa_num(c)} پست در ۲۴ ساعت "
+                                  f"(پایهٔ روزانه: {fa_num(max(b, 1))})"})
+        r = rates.get(part)
+        if r and r["views_delta"] >= 300 and r["views_delta"] >= 2 * r["views_base"]:
+            items.append({"part": part, "kind": "بازدید", "key": f"{day}|{part}|views",
+                          "line": f"• {part}: بازدید +{fa_num(r['views_delta'])} در ۲۴ ساعت "
+                                  f"(پایه: {fa_num(r['views_base'])})"})
+    for row in board:
+        if (row["demand"] >= 2 and row["chg"] is not None and abs(row["chg"]) >= 8
+                and row["last_ts"] >= now - 3 * 86400):
+            items.append({"part": row["part"], "kind": "قیمت", "key": f"{day}|{row['part']}|price",
+                          "line": f"• {row['part']}: قیمت {fa_pct(row['chg'])} "
+                                  f"({fa_num(row['prev'])} → {fa_num(row['last'])} تومان)"})
+    return [i for i in items
+            if not db.execute("SELECT 1 FROM alerts WHERE key=?", (i["key"],)).fetchone()]
+
+
+def management_summary(db, moves, combos, board, brands):
+    """چند جملهٔ تصمیم‌محور از همان اعداد گزارش؛ بدون ادعای فروش یا کلیک که اندازه‌گیری نشده."""
+    lines = []
+    rising = [m for m in moves if m["state"] == "صعودی" and m["cur"] >= 2][:3]
+    falling = [m for m in moves if m["state"] == "نزولی" and m["prev"] >= 2][:2]
+    if rising:
+        lines.append("روند ۷ روزه: " + "، ".join(f"{m['name']} ({fa_num(m['cur'])} پست)" for m in rising)
+                     + " بیشترین رشد را داشتند.")
+    if falling:
+        lines.append("افت نسبی: " + "، ".join(f"{m['name']} ({fa_pct(m['pct'])})" for m in falling) + ".")
+    pm = [r for r in board if r["chg"] is not None and r["demand"] >= 2
+          and r["last_ts"] >= time.time() - 30 * 86400]
+    pm.sort(key=lambda r: -abs(r["chg"]))
+    if pm:
+        r = pm[0]
+        lines.append(f"قیمت: {r['part']} {fa_pct(r['chg'])} "
+                     f"({fa_num(r['prev'])} → {fa_num(r['last'])} تومان، "
+                     f"{fmt_ts(r['prev_ts'])} تا {fmt_ts(r['last_ts'])}).")
+    opp = [c for c in combos if c["state"] == "صعودی" and c["cur"] >= 2][:3]
+    if opp:
+        lines.append("موجودی: " + "، ".join(f"{c['name']} ({fa_num(c['cur'])} پست)" for c in opp)
+                     + " را در اولویت تأمین بگذارید.")
+    if brands:
+        lines.append("برندها: " + "، ".join(f"{b['name']} ({fa_num(b['cur'])} پست)"
+                                          for b in brands[:4]) + ".")
+    since7 = time.time() - 7 * 86400
+    nobs = db.execute("SELECT COUNT(*) FROM prices WHERE kind='seller' AND ts>=?", (since7,)).fetchone()[0]
+    nposts = db.execute("SELECT COUNT(DISTINCT post_id) FROM mentions WHERE kind='seller' AND ts>=?",
+                        (since7,)).fetchone()[0]
+    if nposts:
+        lines.append(f"پوشش قیمت: {fa_num(nobs)} قیمت صریح در ۷ روز از {fa_num(nposts)} پست دارای قطعه "
+                     f"({fa_num(nobs * 100 / nposts)}٪) — بقیهٔ قیمت‌ها در عکس یا سؤال‌محور است.")
+    return lines[:5]
 
 
 def build_report(db, top=500):
@@ -527,9 +816,24 @@ def daily_report(db, hours=48):
         SELECT part, url, MAX(views) v FROM mentions
         WHERE kind='seller' AND ts>=? AND url!=''
         GROUP BY url ORDER BY v DESC LIMIT 12""", (since,)).fetchall()
+    board, _ = price_board(db)
+    moves = market_moves(db)
+    combos_mv = combo_moves(db)
+    brands_mv = brand_moves(db)
+    mgmt = management_summary(db, moves, combos_mv, board, brands_mv)
+    fresh = time.time() - 30 * 86400
+    pmoves = [r for r in board if r["chg"] is not None and r["demand"] >= 1 and r["last_ts"] >= fresh]
+    pmoves.sort(key=lambda r: -abs(r["chg"]))
+    demand7 = dict(db.execute("""SELECT part, COUNT(DISTINCT post_id) FROM mentions
+                                 WHERE kind='seller' AND ts>=? GROUP BY part""",
+                              (time.time() - 7 * 86400,)).fetchall())
+    price_obs = db.execute("SELECT COUNT(*) FROM prices WHERE kind='seller' AND ts>=?",
+                           (since,)).fetchone()[0]
     return {"hours": hours, "since": since, "parts": parts, "combos": combos,
             "bparts": bparts, "brands": brands, "hit_posts": hit_posts or 0,
-            "posts": posts or 0, "channels": channels or 0, "samples": samples}
+            "posts": posts or 0, "channels": channels or 0, "samples": samples,
+            "board": board, "moves": moves, "combos_mv": combos_mv, "brands_mv": brands_mv,
+            "mgmt": mgmt, "pmoves": pmoves[:5], "price_obs": price_obs, "demand7": demand7}
 
 
 def build_daily_html(path, d):
@@ -545,16 +849,51 @@ def build_daily_html(path, d):
     views = sum((p[3] or 0) for p in d["parts"])
     cards = [("پست با نام قطعه", d["hit_posts"]), ("پست فروشنده", d["posts"]),
              ("کانال", d["channels"]), ("بازدید", views),
-             ("قطعه", len(d["parts"])), ("ترکیب", len(d["combos"])), ("برند", len(d["brands"]))]
-    cards_html = "".join(f'<div class="card"><div class="k">{E(k)}</div><div class="v">{E(fa(v))}</div></div>'
+             ("قطعه", len(d["parts"])), ("ترکیب", len(d["combos"])),
+             ("برند", len(d["brands"])), ("قیمت صریح", d["price_obs"])]
+    cards_html = "".join(f'<div class="card"><div class="k">{E(k)}</div><div class="v">{E(fa_num(v))}</div></div>'
                          for k, v in cards)
-    part_rows = [[fa(i), p[0], fa(p[1]), fa(p[2]), fa(p[3] or 0),
+    mgmt_html = "".join(f"<li>{E(x)}</li>" for x in d["mgmt"]) or "<li>سیگنال روشنی در این بازه نبود.</li>"
+    move_rows = [[m["name"], fa_num(m["cur"]), fa_num(m["prev"]), fa_pct(m["pct"]), m["state"]]
+                 for m in d["moves"][:14]]
+    price_rows = []
+    recent = {b["part"]: b for b in d["board"]
+              if b["demand"] > 0 and b["last_ts"] >= time.time() - 60 * 86400}
+    demand7 = d.get("demand7") or {}
+    # ترتیب جدول را تقاضای ۷ روز می‌دهد؛ قلم پرتقاضای بدون قیمت متنی هم ردیف «—» می‌گیرد.
+    for part, n in sorted(demand7.items(), key=lambda x: -x[1])[:18]:
+        r = recent.get(part)
+        if r:
+            rng = (f'{fa_num(r["lo"])}–{fa_num(r["hi"])} (میانه {fa_num(r["med"])})'
+                   if r["lo"] != r["hi"] else "—")
+            price_rows.append([r["part"], r["vehicle"] or "—", r["brand"] or "—",
+                               fa_num(r["last"]), fmt_ts(r["last_ts"]), fa_pct(r["day"]),
+                               fa_pct(r["chg"]) if r["chg"] is not None else "—", rng,
+                               fa_num(n)])
+        else:
+            price_rows.append([part, "—", "—", "—", "—", "—", "—", "—", fa_num(n)])
+    for part, r in recent.items():
+        if len(price_rows) >= 18:
+            break
+        if part in demand7:
+            continue
+        rng = (f'{fa_num(r["lo"])}–{fa_num(r["hi"])} (میانه {fa_num(r["med"])})'
+               if r["lo"] != r["hi"] else "—")
+        price_rows.append([part, r["vehicle"] or "—", r["brand"] or "—",
+                           fa_num(r["last"]), fmt_ts(r["last_ts"]), fa_pct(r["day"]),
+                           fa_pct(r["chg"]) if r["chg"] is not None else "—", rng,
+                           fa_num(r["demand"])])
+    part_rows = [[fa(i), p[0], fa_num(p[1]), fa_num(p[2]), fa_num(p[3] or 0),
                   "، ".join(d["bparts"].get(p[0], [])[:4]) or "—"]
                  for i, p in enumerate(d["parts"][:20], 1)]
-    combo_rows = [[fa(i), c[0], c[1], fa(c[2]), fa(c[3] or 0)]
+    combo_rows = [[fa(i), c[0], c[1], fa_num(c[2]), fa_num(c[3] or 0)]
                   for i, c in enumerate(d["combos"][:15], 1)]
-    brand_rows = [[b, fa(n)] for b, n in d["brands"]]
-    sample_rows = [[s[0], s[1], fa(s[2] or 0)] for s in d["samples"]]
+    brand_rows = [[b, fa_num(n)] for b, n in d["brands"]]
+    sample_rows = [[s[0], s[1], fa_num(s[2] or 0)] for s in d["samples"]]
+
+    price_block = (table(["قطعه", "خودرو", "برند", "آخرین قیمت (تومان)", "تاریخ", "تغییر ۲۴ساعته",
+                          "تغییر نسبت به قیمت قبلی", "کمینه–بیشینه (میانه)", "پست ۷ روز"], price_rows)
+                   if price_rows else "<p>در متن پست‌های این بخش قیمت صریحی ثبت نشده است.</p>")
 
     doc = f"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <title>گزارش روزانهٔ بازار قطعات</title>
@@ -571,17 +910,30 @@ h2 {{ font-size: 13px; margin: 14px 0 6px; padding-bottom: 3px; border-bottom: 2
          background:#f8fafc; }}
 .card .k {{ color:#6b7280; font-size: 8.5px; }}
 .card .v {{ font-weight: bold; font-size: 13px; color:#0f766e; }}
+.mgmt {{ background:#f0fdfa; border:1px solid #99f6e4; border-radius:6px; padding:6px 10px; margin:8px 0; }}
+.mgmt ul {{ margin: 0; padding-right: 16px; }}
+.mgmt li {{ margin: 2px 0; }}
 table {{ width: 100%; border-collapse: collapse; margin: 4px 0 10px; font-size: 8.5px; }}
 thead {{ display: table-header-group; }}
 th, td {{ border: 1px solid #d1d5db; padding: 2px 4px; text-align: right; vertical-align: top; }}
 th {{ background: #e5e7eb; }}
-tbody tr:nth-child(even) {{ background: #f9fafb; }}
+tbody tr:nth-child(even) {{ background: transparent; }}
+tr {{ page-break-inside: avoid; }}
 .url {{ direction: ltr; text-align: left; font-size: 7.5px; word-break: break-all; }}
 .footer {{ margin-top: 12px; border-top:1px solid #d1d5db; padding-top:4px; color:#6b7280; font-size: 8px; }}
 </style></head><body>
-<h1>گزارش روزانهٔ بازار قطعات یدکی</h1>
+<h1>گزارش روزانه و خلاصهٔ مدیریتی بازار قطعات</h1>
 <div class="sub">بازه: {E(fa(d['hours']))} ساعت اخیر (از <span dir="ltr">{E(since)}</span>) — تولید: <span dir="ltr">{E(fmt_ts(time.time()))}</span></div>
 <div class="cards">{cards_html}</div>
+
+<h2>خلاصهٔ مدیریتی</h2>
+<div class="mgmt"><ul>{mgmt_html}</ul></div>
+
+<h2>جهت بازار — ۷ روز اخیر در برابر ۷ روز قبل</h2>
+{table(["قطعه", "این هفته", "هفتهٔ قبل", "تغییر", "وضعیت"], move_rows)}
+
+<h2>قیمت اقلام پرتقاضا</h2>
+{price_block}
 
 <h2>قطعه‌های پرتکرار این بازه</h2>
 {table(["#", "قطعه", "پست", "کانال", "بازدید", "برندهای دیده‌شده"], part_rows)}
@@ -595,13 +947,87 @@ tbody tr:nth-child(even) {{ background: #f9fafb; }}
 <h2>نمونه پست‌ها برای بازبینی</h2>
 {table(["قطعه", "لینک", "بازدید"], sample_rows)}
 
-<div class="footer">پروژهٔ parts-demand — این گزارش فقط بازهٔ اخیر است؛ گزارش تاریخی یک‌ساله در report.pdf.</div>
+<div class="footer">پروژهٔ parts-demand — «تغییر ۲۴ساعته» فقط وقتی پر است که قیمت دیروز و امروز هر دو در متن پست ثبت شده باشد؛
+«تغییر قبلی» نسبت به آخرین قیمت پیش از آن است. ردیف‌هایی که ستون قیمتشان «—» است جزو اقلام پرتقاضا هستند
+ولی قیمت صریح در متن پستشان نبوده. قیمت‌های داخل عکس خوانده نمی‌شوند. گزارش تاریخی یک‌ساله در report.pdf.</div>
 </body></html>"""
     open(path, "w", encoding="utf-8").write(doc)
     return path
 
 
-def build_html(path, summary, top_parts, top_combos, parts, combos, brands, prepared, hints):
+def build_prices_html(path, board, since_ts, demand_parts=()):
+    E = html.escape
+    cutoff = time.time() - 60 * 86400
+    fresh = {b["part"]: b for b in board if b["last_ts"] >= cutoff}
+    dm = dict(demand_parts)
+    movers = [b for b in fresh.values() if b["demand"] > 0 and b["chg"] is not None]
+    movers.sort(key=lambda b: -abs(b["chg"]))
+    movers_html = "".join(
+        f"<li>{E(b['part'])} ({E(b['vehicle'] or 'بدون خودرو')}): {fa_pct(b['chg'])} — "
+        f"{fa_num(b['prev'])} → {fa_num(b['last'])} تومان "
+        f"(<span dir=\"ltr\">{E(fmt_ts(b['prev_ts']))}</span> → <span dir=\"ltr\">{E(fmt_ts(b['last_ts']))}</span>)</li>"
+        for b in movers[:8]) or "<li>قیمت تکراری برای مقایسه ثبت نشده است.</li>"
+    # همهٔ قلم‌های پرتقاضا ردیف می‌گیرند؛ قیمت کهنه یا متنی‌نشده با «—» می‌آید.
+    entries = []
+    for part in set(dm) | set(fresh):
+        b = fresh.get(part)
+        n = max(dm.get(part, 0), b["demand"] if b else 0)
+        if b or part in dm:
+            entries.append((n, part, b))
+    entries.sort(key=lambda x: (-x[0], x[1]))
+    table_rows = []
+    for n, part, b in entries[:40]:
+        if b:
+            table_rows.append([part, b["vehicle"] or "—", b["brand"] or "—",
+                               fa_num(b["last"]), fmt_ts(b["last_ts"]),
+                               fa_pct(b["day"]), fa_pct(b["chg"]) if b["chg"] is not None else "—",
+                               f'{fa_num(b["lo"])}–{fa_num(b["hi"])}', fa_num(b["med"]),
+                               fa_num(n), fa_num(b["n"])])
+        else:
+            table_rows.append([part, "—", "—", "—", "—", "—", "—", "—", "—", fa_num(n), "۰"])
+    body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in table_rows)
+    head = "".join(f"<th>{E(h)}</th>" for h in
+                   ["قطعه", "خودرو", "برند", "آخرین قیمت (تومان)", "تاریخ", "تغییر ۲۴ساعته",
+                    "تغییر قبلی", "بازهٔ ۳۰ روز", "میانه", "پست ۷ روز", "دفعات ثبت"])
+    doc = f"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<title>قیمت روزانهٔ اقلام پرفروش</title>
+<style>
+@page {{ size: A4; margin: 12mm 9mm; }}
+body {{ font-family: Tahoma, "DejaVu Sans", "Noto Naskh Arabic", sans-serif; color:#111827;
+        font-size: 10px; line-height: 1.6; }}
+h1 {{ font-size: 18px; margin: 0 0 2px; }}
+h2 {{ font-size: 13px; margin: 14px 0 6px; padding-bottom: 3px; border-bottom: 2px solid #b45309;
+      color:#b45309; }}
+.sub {{ color:#4b5563; font-size: 10px; margin-bottom: 8px; }}
+.box {{ background:#fffbeb; border:1px solid #fde68a; border-radius:6px; padding:6px 10px; margin:8px 0; }}
+.box ul {{ margin: 0; padding-right: 16px; }}
+table {{ width: 100%; border-collapse: collapse; margin: 4px 0 10px; font-size: 8px; }}
+thead {{ display: table-header-group; }}
+th, td {{ border: 1px solid #d1d5db; padding: 2px 4px; text-align: right; vertical-align: top; }}
+th {{ background: #fef3c7; }}
+tbody tr:nth-child(even) {{ background: transparent; }}
+tr {{ page-break-inside: avoid; }}
+.footer {{ margin-top: 12px; border-top:1px solid #d1d5db; padding-top:4px; color:#6b7280; font-size: 8px; }}
+</style></head><body>
+<h1>قیمت روزانهٔ اقلام پرفروش</h1>
+<div class="sub">آخرین قیمت هر قطعه تا <span dir="ltr">{E(fmt_ts(time.time()))}</span> — مبنای داده: قیمت‌های صریحِ متن پست‌های فروشندگان</div>
+
+<h2>بیشترین حرکت قیمت (نسبت به قیمت قبلی)</h2>
+<div class="box"><ul>{movers_html}</ul></div>
+
+<h2>جدول قیمت — مرتب بر تقاضای ۷ روز</h2>
+<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>
+
+<div class="footer">«تغییر ۲۴ساعته» فقط وقتی پر است که قیمت دیروز و امروز هر دو در متن پست ثبت شده باشد؛
+«تغییر قبلی» نسبت به آخرین قیمت پیش از آن است. یک پست چندقطعه‌ای قیمتش به نزدیک‌ترین قطعه نسبت داده می‌شود.
+ردیف‌هایی که قیمتشان «—» است جزو اقلام پرتقاضای ۷ روزند ولی قیمت صریح در متن پستشان نبوده.
+قیمت‌های داخل عکس، فایل PDF یا سؤال‌محور خوانده نمی‌شوند؛ پوشش واقعی در گزارش روزانه ذکر می‌شود.</div>
+</body></html>"""
+    open(path, "w", encoding="utf-8").write(doc)
+    return path
+
+
+def build_html(path, summary, top_parts, top_combos, parts, combos, brands, prepared, hints, board=()):
     E = html.escape
     fa = lambda x: str(x).translate(FA_DIGITS)
 
@@ -638,6 +1064,10 @@ def build_html(path, summary, top_parts, top_combos, parts, combos, brands, prep
                   for b, n, np, v, plist in brands]
     hint_rows = [[cat, "، ".join(bs)] for cat, bs in hints.items()]
     prep = "، ".join(prepared)
+    price_rows = [[b["part"], b["vehicle"] or "—", b["brand"] or "—", fa_num(b["last"]),
+                   fmt_ts(b["last_ts"]), fa_pct(b["day"]),
+                   fa_pct(b["chg"]) if b["chg"] is not None else "—", fa_num(b["demand"])]
+                  for b in [x for x in board if x["demand"] > 0][:30]]
 
     doc = f"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <title>آمار تقاضای قطعات یدکی خودرو</title>
@@ -682,6 +1112,11 @@ li {{ margin-bottom: 2px; }}
 <p class="note">برندهای فهرست آماده: {E(prep)}<br>
 برندهایی که در پست‌ها دیده نشده‌اند با صفر آمده‌اند تا فهرست کامل بماند.</p>
 {table(["دسته", "برندهای پیشنهادی"], hint_rows)}
+
+<h2>قیمت اقلام پرتقاضا (آخرین قیمت ثبت‌شده)</h2>
+{table(["قطعه", "خودرو", "برند", "آخرین قیمت (تومان)", "تاریخ", "تغییر ۲۴ساعته", "تغییر قبلی", "پست ۷ روز"], price_rows)}
+<p class="note">قیمت‌ها از متن صریح پست‌های فروشنده خوانده می‌شوند ({E(fa(summary.get('price_observations', 0)))} مشاهده)؛
+قیمت داخل عکس یا استعلام تلفنی دیده نمی‌شود. «تغییر ۲۴ساعته» فقط با قیمت دیروز و امروز پر می‌شود.</p>
 
 <h2>۵۰۰ ترکیب اول (کامل، با برند)</h2>
 {table(["#", "قطعه", "دسته", "خودرو", "پست", "۹۰ روز", "کانال", "بازدید", "برندهای دیده‌شده", "برندهای پیشنهادی بازار"], all_combo_rows)}
@@ -780,11 +1215,20 @@ def report(args):
         if b not in seen_brands:
             brand_table.append([b, 0, 0, 0, ""])
     brand_table.sort(key=lambda x: (-x[1], x[0]))
+    board, _ = price_board(db)
+    obs = db.execute("""SELECT p.ts, p.part, p.vehicle, p.brand, p.amount, p.channel, q.url
+                        FROM prices p LEFT JOIN posts q ON q.id=p.post_id
+                        WHERE p.kind='seller' ORDER BY p.ts DESC""").fetchall()
+    write_csv(os.path.join(OUT_DIR, "prices.csv"),
+              ["تاریخ", "قطعه", "خودرو", "برند", "قیمت (تومان)", "کانال", "لینک"],
+              [[fmt_ts(ts), part, veh, brand, str(amount), ch, url or ""]
+               for ts, part, veh, brand, amount, ch, url in obs])
     summary = {"posts": total_posts or 0, "posts_seller": s_posts or 0, "posts_news": n_posts or 0,
                "channels": n_ch, "first": fmt_ts(first_ts), "last": fmt_ts(last_ts),
                "posts_scanned": scanned or 0, "combos_total": len(combos), "combos_with_hits": hit_combos,
                "parts_total": len(parts), "parts_with_hits": hit_parts,
                "brands_observed": len(seen_brands), "brands_prepared": len(prepared),
+               "price_observations": len(obs), "parts_with_price": len({o[1] for o in obs}),
                "top_brands": [[b, n] for b, n, nparts, views, plist in brand_table if n > 0][:5],
                "mentions_seller": sum(p[2] for p in parts), "views_seller": sum(p[6] for p in parts)}
     json.dump(summary, open(os.path.join(OUT_DIR, "summary.json"), "w", encoding="utf-8"),
@@ -823,6 +1267,15 @@ def report(args):
     md += ["", "| دسته | برندهای پیشنهادی |", "|------|------------------|"]
     for cat_name, bs in r_hints.items():
         md.append(f"| {cat_name} | {'، '.join(bs)} |")
+    md += ["", "## قیمت اقلام پرتقاضا (آخرین قیمت ثبت‌شده)", "",
+           "| قطعه | خودرو | برند | قیمت (تومان) | تاریخ | تغییر ۲۴ساعته | تغییر قبلی | پست ۷ روز |",
+           "|------|-------|------|----------------|-------|----------------|--------------|-----------|"]
+    for b in [x for x in board if x["demand"] > 0][:25]:
+        md.append(f"| {b['part']} | {b['vehicle'] or '—'} | {b['brand'] or '—'} | {fa_num(b['last'])} | "
+                  f"{fmt_ts(b['last_ts'])} | {fa_pct(b['day'])} | "
+                  f"{fa_pct(b['chg']) if b['chg'] is not None else '—'} | {fa_num(b['demand'])} |")
+    md += ["", f"قیمت صریح ثبت‌شده: {fa_num(len(obs))} مشاهده برای {fa_num(len(board))} قطعه "
+               f"(قیمت‌های داخل عکس خوانده نمی‌شوند)."]
     md += ["", "## روش", "",
            "1. صفحهٔ عمومی هر کانال (`t.me/s/<name>`) با `?before=` تا تاریخ برش عقب می‌رود.",
            "2. در متن هر پست، نام قطعه/خودرو/برند با تطبیق واژه‌ای (طولانی‌ترین نام اول) پیدا می‌شود.",
@@ -844,7 +1297,7 @@ def report(args):
 
     html_path = os.path.join(OUT_DIR, "report.html")
     build_html(html_path, summary, top_parts, top_combos, parts, combos, brand_table,
-               prepared, r_hints)
+               prepared, r_hints, board)
     pdf_path = os.path.join(OUT_DIR, "report.pdf")
     if make_pdf(html_path, pdf_path):
         log.info("PDF نوشته شد: %s", pdf_path)
@@ -914,22 +1367,31 @@ def send_document(path, caption=""):
 
 
 def daily_digest(args):
-    d = daily_report(open_db())
+    db = open_db()
+    take_snapshot(db)
+    d = daily_report(db)
     os.makedirs(OUT_DIR, exist_ok=True)
-    fa = lambda x: str(x).translate(FA_DIGITS)
+    fa_num_local = fa_num
     views = sum((p[3] or 0) for p in d["parts"])
     lines = [f"📅 بازار قطعات — {fmt_ts(time.time())}",
-             f"بازه: {fa(d['hours'])} ساعت اخیر",
-             f"پست فروشنده: {fa(d['posts'])} (با نام قطعه: {fa(d['hit_posts'])}) | کانال: {fa(d['channels'])}",
-             f"قطعه: {fa(len(d['parts']))} | ترکیب: {fa(len(d['combos']))} | "
-             f"برند: {fa(len(d['brands']))} | بازدید: {fa(views)}"]
+             f"بازه: {fa_num_local(d['hours'])} ساعت اخیر | پست فروشنده: {fa_num_local(d['posts'])} "
+             f"(با نام قطعه: {fa_num_local(d['hit_posts'])}) | کانال: {fa_num_local(d['channels'])}",
+             f"قطعه: {fa_num_local(len(d['parts']))} | ترکیب: {fa_num_local(len(d['combos']))} | "
+             f"برند: {fa_num_local(len(d['brands']))} | بازدید: {fa_num_local(views)}"]
+    if d["mgmt"]:
+        lines += ["", "خلاصهٔ مدیریتی:"] + [f"• {x}" for x in d["mgmt"][:3]]
+    if d["pmoves"]:
+        lines += ["", "حرکت قیمت (نسبت به قیمت قبلی):"]
+        for r in d["pmoves"][:5]:
+            lines.append(f"• {r['part']}: {fa_pct(r['chg'])} — {fa_num_local(r['prev'])} → "
+                         f"{fa_num_local(r['last'])} تومان")
     if d["parts"]:
         lines += ["", "۱۰ قطعهٔ پرتکرار این بازه:"]
         for i, p in enumerate(d["parts"][:10], 1):
-            lines.append(f"{fa(i)}. {p[0]} — {fa(p[1])} پست")
+            lines.append(f"{fa_num_local(i)}. {p[0]} — {fa_num_local(p[1])} پست")
         if d["brands"]:
-            lines += ["", "برندها: " + "، ".join(f"{b} ({fa(n)})" for b, n in d["brands"][:6])]
-        lines += ["", "PDF روزانه در پیام بعدی."]
+            lines += ["", "برندها: " + "، ".join(f"{b} ({fa_num_local(n)})" for b, n in d["brands"][:6])]
+        lines += ["", "PDF روزانه و PDF قیمت در پیام‌های بعدی."]
     else:
         lines += ["", "در این بازه پستی با نام قطعه نبود."]
     ok = send("\n".join(lines))
@@ -939,16 +1401,52 @@ def daily_digest(args):
     html_path = os.path.join(OUT_DIR, "daily.html")
     build_daily_html(html_path, d)
     pdf_path = os.path.join(OUT_DIR, "daily.pdf")
+    sent = 0
     if make_pdf(html_path, pdf_path) and send_document(pdf_path, f"گزارش روزانهٔ بازار — {fmt_ts(time.time())}"):
-        log.info("گزارش روزانه ارسال شد · %d قطعه، %d ترکیب", len(d["parts"]), len(d["combos"]))
+        sent += 1
     else:
         log.warning("گزارش روزانه ساخته/ارسال نشد")
+    if d["board"]:
+        price_html = os.path.join(OUT_DIR, "prices.html")
+        demand_parts = sorted(d["demand7"].items(), key=lambda x: -x[1])
+        build_prices_html(price_html, d["board"], d["since"], demand_parts)
+        price_pdf = os.path.join(OUT_DIR, "prices.pdf")
+        if make_pdf(price_html, price_pdf) and send_document(
+                price_pdf, f"قیمت روزانهٔ اقلام پرفروش — {fmt_ts(time.time())}"):
+            sent += 1
+        else:
+            log.warning("گزارش قیمت ساخته/ارسال نشد")
+    log.info("گزارش روزانه ارسال شد · %d قطعه، %d ترکیب، %d قیمت، %d فایل",
+             len(d["parts"]), len(d["combos"]), d["price_obs"], sent)
+    return ok
+
+
+def alerts_digest(args):
+    db = open_db()
+    take_snapshot(db)
+    fresh = detect_alerts(db)
+    if not fresh:
+        log.info("هشدار تازه‌ای نبود")
+        return True
+    lines = [f"🚨 هشدار بازار — {fmt_ts(time.time())} (UTC)", ""]
+    lines += [i["line"] for i in fresh[:20]]
+    lines += ["", "معیار: جهش تعداد پست در ۲۴ ساعت نسبت به پایهٔ ۱۴ روز، رشد بازدید روزانه، "
+                  "یا تغییر قیمت ≥۸٪ در قطعه‌های پرتقاضا."]
+    ok = send("\n".join(lines))
+    if ok:
+        for i in fresh:
+            db.execute("INSERT OR REPLACE INTO alerts(key, ts, note) VALUES(?,?,?)",
+                       (i["key"], time.time(), i["kind"]))
+        db.commit()
+        log.info("هشدار ارسال شد: %d مورد", len(fresh))
     return ok
 
 
 def digest(args):
     if getattr(args, "daily", False):
         return daily_digest(args)
+    if getattr(args, "alerts", False):
+        return alerts_digest(args)
     summary, top_parts, _ = report(args)
     fa = lambda x: str(x).translate(FA_DIGITS)
     lines = [f"📊 آمار تقاضای قطعات — {fmt_ts(time.time())}",
@@ -956,6 +1454,8 @@ def digest(args):
              f"(خبری: {fa(summary['posts_news'])})",
              f"بازه: {summary['first']} تا {summary['last']}",
              f"ترکیب دیده‌شده: {fa(summary['combos_with_hits'])} از {fa(summary['combos_total'])}",
+             f"قیمت ثبت‌شده: {fa_num(summary.get('price_observations', 0))} "
+             f"برای {fa_num(summary.get('parts_with_price', 0))} قطعه",
              "", "۱۵ قطعهٔ پرتکرار در بازار:"]
     for i, p in enumerate([p for p in top_parts if p[2] > 0][:15], 1):
         lines.append(f"{fa(i)}. {p[0]} — {fa(p[2])} پست ({fa(p[3])} در ۹۰ روز)")
@@ -966,12 +1466,13 @@ def digest(args):
     ok = send("\n".join(lines))
     sent = 0
     for name, cap in (("report.pdf", "گزارش کامل (PDF)"),
+                      ("prices.csv", "قیمت‌های ثبت‌شده"),
                       ("top500.csv", "۵۰۰ ترکیب پرتقاضا"),
                       ("parts_frequency.csv", "ماتریس کامل ترکیب‌ها")):
         if send_document(os.path.join(OUT_DIR, name), f"{cap} — {fmt_ts(time.time())}"):
             sent += 1
         time.sleep(1.0)
-    log.info("خلاصه %s · فایل‌ها: %d از ۳", "ارسال شد" if ok else "ارسال نشد (توکن/چت تنظیم نشده)", sent)
+    log.info("خلاصه %s · فایل‌ها: %d از ۴", "ارسال شد" if ok else "ارسال نشد (توکن/چت تنظیم نشده)", sent)
     return ok
 
 
@@ -1040,7 +1541,8 @@ def main():
 
     d = sub.add_parser("digest", help="ارسال خلاصه به تلگرام")
     d.add_argument("--top", type=int, default=int(os.environ.get("TOP", "500")))
-    d.add_argument("--daily", action="store_true", help="فقط گزارش کوتاه بازهٔ اخیر (برای اجرای روزانه)")
+    d.add_argument("--daily", action="store_true", help="گزارش کوتاه بازهٔ اخیر + PDF روزانه و قیمت")
+    d.add_argument("--alerts", action="store_true", help="فقط هشدارهای جهش (بدون PDF)")
     sub.add_parser("rebuild", help="استخراج دوبارهٔ نام‌ها از پست‌های ذخیره‌شده (بدون شبکه)")
     sub.add_parser("selftest", help="تست تطبیق نام‌ها")
 

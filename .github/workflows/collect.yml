@@ -2,8 +2,8 @@ name: آمار تقاضای قطعات
 
 on:
   schedule:
-    # اجرای روزانه: برداشت افزایشی ۳۰ روز اخیر
-    - cron: "10 4 * * *"
+    # هر ۲ ساعت: هشدار متنی جهش؛ ساعت ۰۴ UTC گزارش روزانه + PDF قیمت؛ روز اول ماه گزارش کامل
+    - cron: "10 */2 * * *"
   workflow_dispatch:
     inputs:
       days:
@@ -12,7 +12,7 @@ on:
       pages:
         description: "حداکثر صفحه در هر کانال (هر صفحه ~۲۰ پست)"
         default: "40"
-  # backstop: هر تغییر واقعی در منابع یا کد همان لحظه یک دور کامل می‌زند
+  # backstop: هر تغییر واقعی در منابع یا کد همان لحظه یک دور هشدار می‌زند
   push:
     branches: [main]
     paths:
@@ -54,23 +54,31 @@ jobs:
           fi
           rm -f data/parts.db-wal data/parts.db-shm
 
-      - name: تعیین بازه‌ی اجرا
+      - name: تعیین بازه و حالت اجرا
         env:
           INPUT_DAYS: ${{ github.event.inputs.days }}
           INPUT_PAGES: ${{ github.event.inputs.pages }}
+          EVENT: ${{ github.event_name }}
         run: |
-          if [ -n "$INPUT_DAYS" ]; then
-            days="$INPUT_DAYS"; pages="${INPUT_PAGES:-40}"
-          elif ! git ls-remote --exit-code --heads origin state >/dev/null 2>&1; then
-            days=365; pages=40   # اولین اجرا: ساخت پایه‌ی یک‌ساله
-          elif [ "$(date -u +%d)" = "01" ]; then
-            days=365; pages=40   # اجرای کامل ماهانه
-          else
-            days=30; pages=10    # برداشت افزایشی روزانه
+          mode=alerts
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            mode=full
+          elif [ "$EVENT" = "schedule" ] && [ "$(date -u +%H)" = "04" ]; then
+            mode=daily
+            if [ "$(date -u +%d)" = "01" ]; then mode=full; fi
           fi
+          if ! git ls-remote --exit-code --heads origin state >/dev/null 2>&1; then
+            mode=full   # اولین اجرا: ساخت پایه‌ی یک‌ساله
+          fi
+          case "$mode" in
+            full)   days="${INPUT_DAYS:-365}"; pages="${INPUT_PAGES:-40}" ;;
+            daily)  days=30; pages=10 ;;
+            *)      days=3;  pages=2 ;;
+          esac
+          echo "MODE=$mode" >> "$GITHUB_ENV"
           echo "DAYS=$days" >> "$GITHUB_ENV"
           echo "PAGES=$pages" >> "$GITHUB_ENV"
-          echo "این دور: days=$days pages=$pages"
+          echo "این دور: mode=$mode days=$days pages=$pages"
 
       - name: ساخت کاتالوگ و تست تطبیق نام‌ها
         run: |
@@ -86,25 +94,27 @@ jobs:
       - name: استخراج دوباره و ساخت جدول‌ها
         run: |
           python collector.py rebuild
-          python collector.py report --top 500
+          if [ "$MODE" != "alerts" ]; then python collector.py report --top 500; fi
 
       - name: ارسال گزارش به تلگرام
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
-          if [ "$DAYS" -ge 365 ]; then
-            python -u collector.py digest --top 500   # گزارش کامل: PDF تاریخی + CSV
-          else
-            python -u collector.py digest --daily     # گزارش روزانه: PDF بازهٔ اخیر
-          fi
+          case "$MODE" in
+            full)  python -u collector.py digest --top 500 ;;   # PDF تاریخی + CSV
+            daily) python -u collector.py digest --daily ;;     # PDF روزانه + PDF قیمت
+            *)     python -u collector.py digest --alerts ;;    # فقط هشدار متنی
+          esac
 
       - name: نگه‌داشتن خروجی‌ها
+        if: env.MODE != 'alerts'
         uses: actions/upload-artifact@v4
         with:
           name: parts-report-${{ github.run_number }}
           path: out/
           retention-days: 90
+          if-no-files-found: ignore
 
       - name: ذخیره‌ی پایگاه داده روی شاخه‌ی state
         if: always()

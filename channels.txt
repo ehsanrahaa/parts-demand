@@ -43,4 +43,8 @@ saberiyadak
 pridyadak
 phaetonghate
 
+# --- کشف‌شده در جست‌وجوی ۲۰۲۶-۱۱-۱۷ (فقط آن‌هایی که پیش‌نمایش عمومی متن دارد) ---
+jahankhahyadak
+carsparepartt
+
 # کانال‌های خبری خودرو در news.txt هستند (ستون جداگانه در گزارش).

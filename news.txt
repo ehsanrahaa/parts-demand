@@ -3,3 +3,5 @@
 asrekhodro
 khodrobank
 pedalnews
+akhbar_khodroei
+akharin_khodro
