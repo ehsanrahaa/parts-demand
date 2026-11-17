@@ -88,11 +88,16 @@ jobs:
           python collector.py rebuild
           python collector.py report --top 500
 
-      - name: ارسال خلاصه به تلگرام
+      - name: ارسال گزارش به تلگرام
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python collector.py digest
+        run: |
+          if [ "$DAYS" -ge 365 ]; then
+            python -u collector.py digest --top 500   # گزارش کامل: PDF تاریخی + CSV
+          else
+            python -u collector.py digest --daily     # گزارش روزانه: PDF بازهٔ اخیر
+          fi
 
       - name: نگه‌داشتن خروجی‌ها
         uses: actions/upload-artifact@v4

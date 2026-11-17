@@ -485,6 +485,111 @@ def make_pdf(html_path, pdf_path):
     return False
 
 
+def daily_report(db, hours=48):
+    """تصویر کوتاه بازار در بازهٔ اخیر. ۴۸ ساعت (نه ۲۴) تا یک نوبتِ عقب‌افتادهٔ زمان‌بند داده را از دست ندهد."""
+    since = time.time() - hours * 3600
+    parts = db.execute("""
+        SELECT m.part, COUNT(DISTINCT m.post_id), COUNT(DISTINCT m.channel), SUM(m.views)
+        FROM mentions m WHERE m.kind='seller' AND m.ts>=?
+        GROUP BY m.part ORDER BY 2 DESC""", (since,)).fetchall()
+    combos = db.execute("""
+        SELECT part, vehicle, COUNT(DISTINCT post_id), SUM(views)
+        FROM pairs WHERE kind='seller' AND ts>=?
+        GROUP BY part, vehicle ORDER BY 3 DESC""", (since,)).fetchall()
+    bparts = {}
+    for p, b, c in db.execute("""
+        SELECT b.part, b.brand, COUNT(DISTINCT b.post_id)
+        FROM brand_mentions b JOIN posts p ON p.id=b.post_id
+        WHERE p.kind='seller' AND p.ts>=? GROUP BY 1,2 ORDER BY 3 DESC""", (since,)).fetchall():
+        bparts.setdefault(p, []).append(f"{b} ({c})")
+    brands = db.execute("""
+        SELECT brand, COUNT(DISTINCT post_id) FROM brand_mentions b
+        JOIN posts p ON p.id=b.post_id WHERE p.kind='seller' AND p.ts>=?
+        GROUP BY brand ORDER BY 2 DESC""", (since,)).fetchall()
+    hit_posts, hit_ch = db.execute("""
+        SELECT COUNT(DISTINCT post_id), COUNT(DISTINCT channel) FROM mentions
+        WHERE kind='seller' AND ts>=?""", (since,)).fetchone()
+    posts, channels = db.execute("""
+        SELECT COUNT(*), COUNT(DISTINCT channel) FROM posts
+        WHERE kind='seller' AND ts>=?""", (since,)).fetchone()
+    samples = db.execute("""
+        SELECT part, url, MAX(views) v FROM mentions
+        WHERE kind='seller' AND ts>=? AND url!=''
+        GROUP BY url ORDER BY v DESC LIMIT 12""", (since,)).fetchall()
+    return {"hours": hours, "since": since, "parts": parts, "combos": combos,
+            "bparts": bparts, "brands": brands, "hit_posts": hit_posts or 0,
+            "posts": posts or 0, "channels": channels or 0, "samples": samples}
+
+
+def build_daily_html(path, d):
+    E = html.escape
+    fa = lambda x: str(x).translate(FA_DIGITS)
+    since = fmt_ts(d["since"])
+
+    def table(headers, rows):
+        h = "".join(f"<th>{E(str(x))}</th>" for x in headers)
+        body = "".join("<tr>" + "".join(f"<td>{E(str(c))}</td>" for c in row) + "</tr>" for row in rows)
+        return f"<table><thead><tr>{h}</tr></thead><tbody>{body}</tbody></table>"
+
+    views = sum((p[3] or 0) for p in d["parts"])
+    cards = [("پست با نام قطعه", d["hit_posts"]), ("پست فروشنده", d["posts"]),
+             ("کانال", d["channels"]), ("بازدید", views),
+             ("قطعه", len(d["parts"])), ("ترکیب", len(d["combos"])), ("برند", len(d["brands"]))]
+    cards_html = "".join(f'<div class="card"><div class="k">{E(k)}</div><div class="v">{E(fa(v))}</div></div>'
+                         for k, v in cards)
+    part_rows = [[fa(i), p[0], fa(p[1]), fa(p[2]), fa(p[3] or 0),
+                  "، ".join(d["bparts"].get(p[0], [])[:4]) or "—"]
+                 for i, p in enumerate(d["parts"][:20], 1)]
+    combo_rows = [[fa(i), c[0], c[1], fa(c[2]), fa(c[3] or 0)]
+                  for i, c in enumerate(d["combos"][:15], 1)]
+    brand_rows = [[b, fa(n)] for b, n in d["brands"]]
+    sample_rows = [[s[0], s[1], fa(s[2] or 0)] for s in d["samples"]]
+
+    doc = f"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<title>گزارش روزانهٔ بازار قطعات</title>
+<style>
+@page {{ size: A4; margin: 12mm 9mm; }}
+body {{ font-family: Tahoma, "DejaVu Sans", "Noto Naskh Arabic", sans-serif; color:#111827;
+        font-size: 10px; line-height: 1.6; }}
+h1 {{ font-size: 18px; margin: 0 0 2px; }}
+h2 {{ font-size: 13px; margin: 14px 0 6px; padding-bottom: 3px; border-bottom: 2px solid #0f766e;
+      color:#0f766e; page-break-after: avoid; }}
+.sub {{ color:#4b5563; font-size: 10px; margin-bottom: 8px; }}
+.cards {{ display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0 4px; }}
+.card {{ border:1px solid #d1d5db; border-radius: 5px; padding: 4px 8px; min-width: 95px;
+         background:#f8fafc; }}
+.card .k {{ color:#6b7280; font-size: 8.5px; }}
+.card .v {{ font-weight: bold; font-size: 13px; color:#0f766e; }}
+table {{ width: 100%; border-collapse: collapse; margin: 4px 0 10px; font-size: 8.5px; }}
+thead {{ display: table-header-group; }}
+th, td {{ border: 1px solid #d1d5db; padding: 2px 4px; text-align: right; vertical-align: top; }}
+th {{ background: #e5e7eb; }}
+tbody tr:nth-child(even) {{ background: #f9fafb; }}
+.url {{ direction: ltr; text-align: left; font-size: 7.5px; word-break: break-all; }}
+.footer {{ margin-top: 12px; border-top:1px solid #d1d5db; padding-top:4px; color:#6b7280; font-size: 8px; }}
+</style></head><body>
+<h1>گزارش روزانهٔ بازار قطعات یدکی</h1>
+<div class="sub">بازه: {E(fa(d['hours']))} ساعت اخیر (از <span dir="ltr">{E(since)}</span>) — تولید: <span dir="ltr">{E(fmt_ts(time.time()))}</span></div>
+<div class="cards">{cards_html}</div>
+
+<h2>قطعه‌های پرتکرار این بازه</h2>
+{table(["#", "قطعه", "پست", "کانال", "بازدید", "برندهای دیده‌شده"], part_rows)}
+
+<h2>ترکیب‌های پرتکرار قطعه×خودرو</h2>
+{table(["#", "قطعه", "خودرو", "پست", "بازدید"], combo_rows)}
+
+<h2>برندها</h2>
+{table(["برند", "پست"], brand_rows)}
+
+<h2>نمونه پست‌ها برای بازبینی</h2>
+{table(["قطعه", "لینک", "بازدید"], sample_rows)}
+
+<div class="footer">پروژهٔ parts-demand — این گزارش فقط بازهٔ اخیر است؛ گزارش تاریخی یک‌ساله در report.pdf.</div>
+</body></html>"""
+    open(path, "w", encoding="utf-8").write(doc)
+    return path
+
+
 def build_html(path, summary, top_parts, top_combos, parts, combos, brands, prepared, hints):
     E = html.escape
     fa = lambda x: str(x).translate(FA_DIGITS)
@@ -797,7 +902,42 @@ def send_document(path, caption=""):
     return False
 
 
+def daily_digest(args):
+    d = daily_report(open_db())
+    os.makedirs(OUT_DIR, exist_ok=True)
+    fa = lambda x: str(x).translate(FA_DIGITS)
+    views = sum((p[3] or 0) for p in d["parts"])
+    lines = [f"📅 بازار قطعات — {fmt_ts(time.time())}",
+             f"بازه: {fa(d['hours'])} ساعت اخیر",
+             f"پست فروشنده: {fa(d['posts'])} (با نام قطعه: {fa(d['hit_posts'])}) | کانال: {fa(d['channels'])}",
+             f"قطعه: {fa(len(d['parts']))} | ترکیب: {fa(len(d['combos']))} | "
+             f"برند: {fa(len(d['brands']))} | بازدید: {fa(views)}"]
+    if d["parts"]:
+        lines += ["", "۱۰ قطعهٔ پرتکرار این بازه:"]
+        for i, p in enumerate(d["parts"][:10], 1):
+            lines.append(f"{fa(i)}. {p[0]} — {fa(p[1])} پست")
+        if d["brands"]:
+            lines += ["", "برندها: " + "، ".join(f"{b} ({fa(n)})" for b, n in d["brands"][:6])]
+        lines += ["", "PDF روزانه در پیام بعدی."]
+    else:
+        lines += ["", "در این بازه پستی با نام قطعه نبود."]
+    ok = send("\n".join(lines))
+    if not d["parts"]:
+        log.info("گزارش روزانه: در بازه پستی نبود")
+        return ok
+    html_path = os.path.join(OUT_DIR, "daily.html")
+    build_daily_html(html_path, d)
+    pdf_path = os.path.join(OUT_DIR, "daily.pdf")
+    if make_pdf(html_path, pdf_path) and send_document(pdf_path, f"گزارش روزانهٔ بازار — {fmt_ts(time.time())}"):
+        log.info("گزارش روزانه ارسال شد · %d قطعه، %d ترکیب", len(d["parts"]), len(d["combos"]))
+    else:
+        log.warning("گزارش روزانه ساخته/ارسال نشد")
+    return ok
+
+
 def digest(args):
+    if getattr(args, "daily", False):
+        return daily_digest(args)
     summary, top_parts, _ = report(args)
     fa = lambda x: str(x).translate(FA_DIGITS)
     lines = [f"📊 آمار تقاضای قطعات — {fmt_ts(time.time())}",
@@ -889,6 +1029,7 @@ def main():
 
     d = sub.add_parser("digest", help="ارسال خلاصه به تلگرام")
     d.add_argument("--top", type=int, default=int(os.environ.get("TOP", "500")))
+    d.add_argument("--daily", action="store_true", help="فقط گزارش کوتاه بازهٔ اخیر (برای اجرای روزانه)")
     sub.add_parser("rebuild", help="استخراج دوبارهٔ نام‌ها از پست‌های ذخیره‌شده (بدون شبکه)")
     sub.add_parser("selftest", help="تست تطبیق نام‌ها")
 

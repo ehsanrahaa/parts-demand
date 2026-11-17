@@ -17,6 +17,7 @@
 | `summary.json` | آمار پوشش: تعداد پست، بازه، ترکیب‌های دیده‌شده، برندها |
 | `report.html` | همان گزارش با چیدمان راست‌به‌چپ |
 | `report.pdf` | **گزارش اصلی**؛ همهٔ جدول‌ها با برندهای دیده‌شده و برندهای پیشنهادی بازار |
+| `daily.html` / `daily.pdf` | گزارش کوتاه ۴۸ ساعت اخیر (فقط در `digest --daily`) |
 | `report.md` | نسخهٔ متنی گزارش برای گیت و بازبینی سریع |
 
 PDF با Chrome/Chromium بی‌سر ساخته می‌شود (روی مک: Chrome نصب باشد؛ روی GitHub Actions از Chrome آمادهٔ runner استفاده می‌شود). اگر Chrome پیدا نشود، بقیهٔ خروجی‌ها ساخته می‌شوند و فقط PDF با هشدار رد می‌شود.
@@ -78,7 +79,8 @@ cp .env.example .env          # اختیاری: TELEGRAM_TOKEN و CHAT_ID برا
 ```bash
 python collector.py collect --days 365 --pages 40 --workers 3   # برداشت
 python collector.py report --top 500                            # ساخت جدول‌ها
-python collector.py digest                                      # ارسال خلاصه + PDF + CSV به تلگرام (اگر توکن باشد)
+python collector.py digest                                      # ارسال خلاصه + PDF تاریخی + CSV به تلگرام
+python collector.py digest --daily                              # گزارش روزانهٔ ۴۸ ساعت اخیر (PDF کوتاه)
 python collector.py rebuild                                     # استخراج دوباره از پست‌های ذخیره‌شده، بدون شبکه
 python collector.py selftest                                    # تست تطبیق نام‌ها
 python collector.py probe --days 365                            # سلامت و حجم هر کانال
@@ -95,7 +97,7 @@ python collector.py probe --days 365                            # سلامت و 
 
 ## اجرای خودکار روی GitHub Actions
 
-`.github/workflows/collect.yml` روزانه یک برداشت افزایشی و روز اول هر ماه یک اجرای کامل می‌زند، گزارش را به‌عنوان artifact نگه می‌دارد و `data/parts.db` را روی شاخه‌ی `state` ذخیره می‌کند تا تاریخ بین اجراها بماند. با `workflow_dispatch` هم می‌توان دستی اجرا کرد.
+`.github/workflows/collect.yml` روزانه یک برداشت افزایشی و یک **گزارش روزانهٔ ۴۸ ساعت اخیر** (`daily.pdf`) می‌فرستد؛ روز اول هر ماه یک اجرای کامل ۳۶۵ روزه با **گزارش تاریخی کامل** (`report.pdf` + CSVها) می‌زند. گزارش‌ها به‌عنوان artifact هم نگه داشته می‌شوند و `data/parts.db` روی شاخه‌ی `state` ذخیره می‌شود تا تاریخ بین اجراها بماند. با `workflow_dispatch` هم می‌توان دستی اجرا کرد.
 
 برای فعال‌شدن ارسال گزارش به تلگرام، در Settings → Secrets and variables → Actions دو secret بسازید: `TELEGRAM_TOKEN` و `CHAT_ID`. هر دور، خلاصه + `report.pdf` + دو CSV را می‌فرستد؛ بدون این‌ها همه‌چیز کار می‌کند و فقط خلاصه در لاگ می‌آید. هیچ توکنی در کد نیست.
 
