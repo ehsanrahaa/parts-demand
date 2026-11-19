@@ -26,6 +26,7 @@ out = {
     "parts": seed["parts"],
     "vehicles": seed["vehicles"],
     "brands": seed["brands"],
+    "brand_aliases": seed.get("brand_aliases", {}),
     "combos": combos,
 }
 json.dump(out, open(os.path.join(HERE, "catalog.json"), "w", encoding="utf-8"),

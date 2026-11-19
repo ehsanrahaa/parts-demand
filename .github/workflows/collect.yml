@@ -2,7 +2,9 @@ name: آمار تقاضای قطعات
 
 on:
   schedule:
-    # هر ۲ ساعت: هشدار متنی جهش؛ ساعت ۰۴ UTC گزارش روزانه + PDF قیمت؛ روز اول ماه گزارش کامل
+    # هر ۲ ساعت بیدار می‌شود؛ حالت از تاریخچهٔ ارسال‌ها (meta) انتخاب می‌شود نه از ساعت:
+    # گزارش روزانه اگر ۲۰ ساعت از آخری گذشته باشد، گزارش کامل اگر ماه عوض شده باشد، وگرنه هشدار.
+    # GitHub زمان‌بند را دیر/نامنظم اجرا می‌کند؛ به ساعت ۰۴ UTC تکیه نمی‌کنیم.
     - cron: "10 */2 * * *"
   workflow_dispatch:
     inputs:
@@ -12,6 +14,9 @@ on:
       pages:
         description: "حداکثر صفحه در هر کانال (هر صفحه ~۲۰ پست)"
         default: "40"
+      mode:
+        description: "full | daily | alerts | auto"
+        default: "full"
   # backstop: هر تغییر واقعی در منابع یا کد همان لحظه یک دور هشدار می‌زند
   push:
     branches: [main]
@@ -58,22 +63,28 @@ jobs:
         env:
           INPUT_DAYS: ${{ github.event.inputs.days }}
           INPUT_PAGES: ${{ github.event.inputs.pages }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
           EVENT: ${{ github.event_name }}
         run: |
-          mode=alerts
+          # زمان‌بند GitHub دیر یا نامنظم اجرا می‌کند؛ حالت را از آخرین ارسال‌های موفق می‌گیریم،
+          # نه از ساعت شروع. هر اجرا اگر گزارش روزانه ۲۰ ساعت عقب افتاده باشد همان را می‌فرستد.
+          mode=""
           if [ "$EVENT" = "workflow_dispatch" ]; then
-            mode=full
-          elif [ "$EVENT" = "schedule" ] && [ "$(date -u +%H)" = "04" ]; then
-            mode=daily
-            if [ "$(date -u +%d)" = "01" ]; then mode=full; fi
+            mode="$INPUT_MODE"
+            [ "$mode" = "auto" ] && mode=""
           fi
-          if ! git ls-remote --exit-code --heads origin state >/dev/null 2>&1; then
-            mode=full   # اولین اجرا: ساخت پایه‌ی یک‌ساله
+          if [ -z "$mode" ]; then
+            if ! git ls-remote --exit-code --heads origin state >/dev/null 2>&1; then
+              mode=full   # اولین اجرا: ساخت پایه‌ی یک‌ساله
+            else
+              mode=$(python collector.py mode)
+            fi
           fi
           case "$mode" in
             full)   days="${INPUT_DAYS:-365}"; pages="${INPUT_PAGES:-40}" ;;
             daily)  days=30; pages=10 ;;
-            *)      days=3;  pages=2 ;;
+            alerts) days=3;  pages=2 ;;
+            *)      echo "حالت نامعتبر: $mode"; exit 1 ;;
           esac
           echo "MODE=$mode" >> "$GITHUB_ENV"
           echo "DAYS=$days" >> "$GITHUB_ENV"
